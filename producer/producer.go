@@ -33,8 +33,10 @@ func main() {
 		// Holds the string that was scanned
 		bytes := scanner.Bytes()
 		if len(bytes) != 0 {
+			sub := "test"
 			message := &azservicebus.Message{
-				Body: bytes,
+				Subject: &sub,
+				Body:    bytes,
 			}
 
 			err = sender.SendMessage(context.TODO(), message, nil)
