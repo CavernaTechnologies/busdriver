@@ -2,8 +2,11 @@ package main
 
 import (
 	"context"
-	"errors"
 	"fmt"
+	"os"
+	"os/signal"
+	"sync"
+	"syscall"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/messaging/azservicebus"
 )
@@ -20,49 +23,70 @@ func main() {
 		nil,
 	)
 
-	for {
-		ctx := context.Background()
+	messages := make(chan *azservicebus.ReceivedMessage, 10)
 
-		messages, err := receiver.ReceiveMessages(ctx,
-			10,
-			nil,
-		)
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go consumer(stop, wg, receiver, messages)
+	go router(stop, wg, receiver, messages)
 
-		if err != nil {
-			panic(err)
-		}
+	exit := make(chan os.Signal, 1)
+	signal.Notify(exit, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-exit
+		close(stop)
+	}()
+	wg.Wait()
+}
 
-		if len(messages) == 0 {
-			break
-		}
+func router(stop <-chan struct{}, wg sync.WaitGroup, receiver *azservicebus.Receiver, messages <-chan *azservicebus.ReceivedMessage) {
+	defer wg.Done()
+	ctx := context.Background()
 
-		for _, message := range messages {
-			// The message body is a []byte. For this example we're just assuming that the body
-			// was a string, converted to bytes but any []byte payload is valid.
-			var body []byte = message.Body
-			fmt.Printf("Message received with body: %s\n", string(body))
-
-			// For more information about settling messages:
-			// https://docs.microsoft.com/azure/service-bus-messaging/message-transfers-locks-settlement#settling-receive-operations
-			err = receiver.CompleteMessage(ctx, message, nil)
+	for message := range messages {
+		select {
+		case <-stop:
+			err := receiver.AbandonMessage(ctx, message, nil)
 
 			if err != nil {
-				var sbErr *azservicebus.Error
+				fmt.Println(err)
+			}
+		default:
+			b := string(message.Body)
+			fmt.Println(b)
 
-				if errors.As(err, &sbErr) && sbErr.Code == azservicebus.CodeLockLost {
-					// The message lock has expired. This isn't fatal for the client, but it does mean
-					// that this message can be received by another Receiver (or potentially this one!).
-					fmt.Printf("Message lock expired\n")
+			err := receiver.CompleteMessage(ctx, message, nil)
 
-					// You can extend the message lock by calling receiver.RenewMessageLock(msg) before the
-					// message lock has expired.
-					continue
-				}
+			if err != nil {
+				fmt.Println(err)
+			}
+		}
+	}
+}
 
+func consumer(stop <-chan struct{}, wg sync.WaitGroup, receiver *azservicebus.Receiver, messages chan<- *azservicebus.ReceivedMessage) {
+	defer wg.Done()
+	ctx := context.Background()
+
+	for {
+		select {
+		case <-stop:
+			close(messages)
+			return
+		default:
+			m, err := receiver.ReceiveMessages(ctx,
+				10,
+				nil,
+			)
+
+			if err != nil {
 				panic(err)
 			}
 
-			fmt.Printf("Received and completed the message\n")
+			for _, message := range m {
+				messages <- message
+			}
 		}
 	}
 }
