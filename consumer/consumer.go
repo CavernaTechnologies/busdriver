@@ -23,13 +23,19 @@ func main() {
 		cancel()
 	}()
 
-	c := NewConsumer(ctx, "Endpoint=sb://cavernatesting.servicebus.windows.net/;SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=oXi4UpGB9/cQ4j47Fg4iaG5YiHyHKZHXrYf2M3/ySvo=", "testqueue")
+	client, err := azservicebus.NewClientFromConnectionString("Endpoint=sb://cavernatesting.servicebus.windows.net/;SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=oXi4UpGB9/cQ4j47Fg4iaG5YiHyHKZHXrYf2M3/ySvo=", nil)
+
+	if err != nil {
+		panic(err)
+	}
+
+	c := NewConsumer(ctx, client, "testqueue")
 
 	c.AddRoute("test", test)
 
 	c.Run()
-	c.wg.Wait()
 }
+
 func test(ctx context.Context, message *azservicebus.ReceivedMessage) {
 	fmt.Println("Subject:", *message.Subject)
 
@@ -47,6 +53,10 @@ type Consumer struct {
 	routes   map[string]func(context.Context, *azservicebus.ReceivedMessage)
 }
 
+func (c *Consumer) Wait() {
+	c.wg.Wait()
+}
+
 func (c *Consumer) AddRoute(name string, fn func(context.Context, *azservicebus.ReceivedMessage)) {
 	if c.routes[name] != nil {
 		panic(fmt.Sprint("Route has already been delcared:", name))
@@ -54,7 +64,7 @@ func (c *Consumer) AddRoute(name string, fn func(context.Context, *azservicebus.
 	c.routes[name] = fn
 }
 
-func (c *Consumer) Run() {
+func (c *Consumer) runStandard() {
 	for {
 		select {
 		case <-c.rctx.Done():
@@ -62,7 +72,7 @@ func (c *Consumer) Run() {
 			return
 		default:
 			messages, err := c.receiver.ReceiveMessages(c.rctx,
-				1,
+				10,
 				nil,
 			)
 
@@ -86,27 +96,30 @@ func (c *Consumer) Run() {
 				}
 
 				c.wg.Add(1)
-				go func(fn func(context.Context, *azservicebus.ReceivedMessage), m *azservicebus.ReceivedMessage) {
+				go func(m *azservicebus.ReceivedMessage) {
 					defer c.wg.Done()
 					fn(ctx, m)
 					c.receiver.CompleteMessage(ctx, m, nil)
-				}(fn, message)
+				}(message)
 			}
 		}
 	}
 }
 
-func NewConsumer(ctx context.Context, connection string, endpoint string) *Consumer {
-	client, err := azservicebus.NewClientFromConnectionString("Endpoint=sb://cavernatesting.servicebus.windows.net/;SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey=oXi4UpGB9/cQ4j47Fg4iaG5YiHyHKZHXrYf2M3/ySvo=", nil)
+func (c *Consumer) Run() {
+	c.runStandard()
+	c.Wait()
+}
+
+func NewConsumer(ctx context.Context, client *azservicebus.Client, queueName string) *Consumer {
+	receiver, err := client.NewReceiverForQueue(
+		queueName,
+		nil,
+	)
 
 	if err != nil {
 		panic(err)
 	}
-
-	receiver, err := client.NewReceiverForQueue(
-		"testqueue",
-		nil,
-	)
 
 	return &Consumer{
 		receiver: receiver,
