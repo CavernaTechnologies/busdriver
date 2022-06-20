@@ -1,4 +1,4 @@
-module github.com/CavernaTechnologies/caverna-testing
+module github.com/CavernaTechnologies/bus-driver
 
 go 1.18
 
