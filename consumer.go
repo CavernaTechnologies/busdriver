@@ -3,14 +3,20 @@ package main
 import (
 	"context"
 	"errors"
+	"sync"
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/messaging/azservicebus"
 )
 
 type Consumer struct {
+	MaxJobs uint
+
 	receiver *azservicebus.Receiver
 	handlers map[string]func(context.Context, *Job)
+
+	mu      sync.Mutex
+	numJobs uint
 }
 
 func (c *Consumer) AddHandler(name string, fn func(context.Context, *Job)) error {
@@ -38,7 +44,15 @@ func (c *Consumer) Run(ctx context.Context) error {
 		default:
 		}
 
-		messages, err := c.receiver.ReceiveMessages(ctx, 1, nil)
+		n := c.getNumJobs()
+		max := c.MaxJobs
+
+		if n >= max {
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+
+		messages, err := c.receiver.ReceiveMessages(ctx, int(max-n), nil)
 
 		if err != nil {
 			return errors.New("Failed to receive messages")
@@ -64,9 +78,11 @@ func (c *Consumer) Run(ctx context.Context) error {
 				})
 			}
 
+			c.incrementJobs()
 			go func(message *azservicebus.ReceivedMessage) {
 				ctx, cancel := context.WithCancel(context.Background())
 				defer cancel()
+				defer c.decrementJobs()
 
 				j := &Job{
 					receiver: c.receiver,
@@ -79,9 +95,31 @@ func (c *Consumer) Run(ctx context.Context) error {
 	}
 }
 
+func (c *Consumer) getNumJobs() uint {
+	c.mu.Lock()
+	j := c.numJobs
+	c.mu.Unlock()
+	return j
+}
+
+func (c *Consumer) incrementJobs() {
+	c.mu.Lock()
+	c.numJobs += 1
+	c.mu.Unlock()
+}
+
+func (c *Consumer) decrementJobs() {
+	c.mu.Lock()
+	c.numJobs -= 1
+	c.mu.Unlock()
+}
+
 func NewConsumer(receiver *azservicebus.Receiver) *Consumer {
 	return &Consumer{
+		MaxJobs:  100,
 		receiver: receiver,
 		handlers: make(map[string]func(context.Context, *Job)),
+		mu:       sync.Mutex{},
+		numJobs:  0,
 	}
 }
