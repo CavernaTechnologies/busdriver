@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"sync"
-	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/messaging/azservicebus"
 )
@@ -41,12 +40,4 @@ func main() {
 	}
 
 	fmt.Println(*job.Message.Subject)
-
-	job.keepAlive(ctx)
-
-	time.Sleep(45 * time.Second)
-
-	job.Complete(ctx)
-
-	time.Sleep(20 * time.Second)
 }

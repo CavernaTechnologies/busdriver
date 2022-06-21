@@ -2,14 +2,12 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"sync"
-	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/messaging/azservicebus"
 )
 
-const interval = 20
+const leeway = 5
 
 type Job struct {
 	receiver *azservicebus.Receiver
@@ -42,46 +40,33 @@ func (j *Job) closeDoneChanLocked() {
 	}
 }
 
-func (j *Job) Complete(ctx context.Context) {
+func (j *Job) Complete(ctx context.Context) error {
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	j.receiver.CompleteMessage(ctx, j.Message, nil)
+	err := j.receiver.CompleteMessage(ctx, j.Message, nil)
 	j.closeDoneChanLocked()
+	return err
 }
 
-func (j *Job) Abandon(ctx context.Context) {
+func (j *Job) Abandon(ctx context.Context) error {
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	j.receiver.AbandonMessage(ctx, j.Message, nil)
+	err := j.receiver.AbandonMessage(ctx, j.Message, nil)
 	j.closeDoneChanLocked()
+	return err
 }
 
-func (j *Job) Kill(ctx context.Context) {
+func (j *Job) Kill(ctx context.Context) error {
 	j.mu.Lock()
 	defer j.mu.Unlock()
-	j.receiver.DeadLetterMessage(ctx, j.Message, nil)
+	err := j.receiver.DeadLetterMessage(ctx, j.Message, nil)
 	j.closeDoneChanLocked()
+	return err
 }
 
-func (j *Job) keepAlive(ctx context.Context) {
-	go func() {
-		for {
-			time.Sleep(interval * time.Second)
-			j.mu.Lock()
-			select {
-			case <-j.getDoneChanLocked():
-				fmt.Println("Done")
-				j.mu.Unlock()
-				return
-			case <-ctx.Done():
-				fmt.Println("Canceled")
-				j.mu.Unlock()
-				return
-			default:
-			}
-			fmt.Println("Renewing....")
-			j.receiver.RenewMessageLock(ctx, j.Message, nil)
-			j.mu.Unlock()
-		}
-	}()
+func (j *Job) RenewLock(ctx context.Context) error {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	err := j.receiver.RenewMessageLock(ctx, j.Message, nil)
+	return err
 }
