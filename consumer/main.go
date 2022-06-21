@@ -3,7 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
-	"sync"
+	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/messaging/azservicebus"
 )
@@ -21,23 +21,25 @@ func main() {
 		panic(err)
 	}
 
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Second)
+	defer cancel()
 
-	messages, err := receiver.ReceiveMessages(ctx, 1, nil)
+	c := NewConsumer(receiver)
+
+	c.AddHandler("test", test)
+
+	c.Run(ctx)
+}
+
+func test(ctx context.Context, j *Job) {
+	err := j.KeepAlive(ctx)
 
 	if err != nil {
-		panic(err)
+		return
 	}
 
-	var job *Job
+	time.Sleep(60 * time.Second)
 
-	for _, message := range messages {
-		job = &Job{
-			receiver: receiver,
-			Message:  message,
-			mu:       sync.Mutex{},
-		}
-	}
-
-	fmt.Println(*job.Message.Subject)
+	fmt.Println(string(j.Message.Body))
+	j.Complete(ctx)
 }
