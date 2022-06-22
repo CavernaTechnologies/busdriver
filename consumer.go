@@ -3,20 +3,19 @@ package main
 import (
 	"context"
 	"errors"
-	"sync"
+	"fmt"
+	"sync/atomic"
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/messaging/azservicebus"
 )
 
 type Consumer struct {
-	MaxJobs uint
-
 	receiver *azservicebus.Receiver
 	handlers map[string]func(context.Context, *Job)
 
-	mu      sync.Mutex
-	numJobs uint
+	maxJobs     uint32
+	currentJobs uint32
 }
 
 func (c *Consumer) AddHandler(name string, fn func(context.Context, *Job)) error {
@@ -44,15 +43,14 @@ func (c *Consumer) Run(ctx context.Context) error {
 		default:
 		}
 
-		n := c.getNumJobs()
-		max := c.MaxJobs
+		d := c.getJobsDelta()
 
-		if n >= max {
+		if d == 0 {
 			time.Sleep(100 * time.Millisecond)
 			continue
 		}
 
-		messages, err := c.receiver.ReceiveMessages(ctx, int(max-n), nil)
+		messages, err := c.receiver.ReceiveMessages(ctx, int(d), nil)
 
 		if err != nil {
 			return errors.New("Failed to receive messages")
@@ -78,11 +76,11 @@ func (c *Consumer) Run(ctx context.Context) error {
 				})
 			}
 
-			c.incrementJobs()
+			c.incCurrentJobs()
 			go func(message *azservicebus.ReceivedMessage) {
 				ctx, cancel := context.WithCancel(context.Background())
 				defer cancel()
-				defer c.decrementJobs()
+				defer c.decCurrentJobs()
 
 				j := &Job{
 					receiver: c.receiver,
@@ -90,36 +88,54 @@ func (c *Consumer) Run(ctx context.Context) error {
 				}
 
 				fn(ctx, j)
+
+				defer func() {
+					if err := recover(); err != nil {
+						fmt.Println("Recovered from panic. Killing message...")
+						j.Kill(ctx)
+					}
+				}()
 			}(message)
 		}
 	}
 }
 
-func (c *Consumer) getNumJobs() uint {
-	c.mu.Lock()
-	j := c.numJobs
-	c.mu.Unlock()
-	return j
+func (c *Consumer) getCurrentJobs() uint32 {
+	return atomic.LoadUint32(&c.currentJobs)
 }
 
-func (c *Consumer) incrementJobs() {
-	c.mu.Lock()
-	c.numJobs += 1
-	c.mu.Unlock()
+func (c *Consumer) incCurrentJobs() {
+	atomic.AddUint32(&c.currentJobs, 1)
 }
 
-func (c *Consumer) decrementJobs() {
-	c.mu.Lock()
-	c.numJobs -= 1
-	c.mu.Unlock()
+func (c *Consumer) decCurrentJobs() {
+	atomic.AddUint32(&c.currentJobs, ^uint32(0))
+}
+
+func (c *Consumer) SetMaxJobs(n uint32) {
+	atomic.StoreUint32(&c.maxJobs, n)
+}
+
+func (c *Consumer) GetMaxJobs() uint32 {
+	return atomic.LoadUint32(&c.maxJobs)
+}
+
+func (c *Consumer) getJobsDelta() uint32 {
+	cur := c.getCurrentJobs()
+	max := c.GetMaxJobs()
+
+	if cur >= max {
+		return 0
+	}
+
+	return max - cur
 }
 
 func NewConsumer(receiver *azservicebus.Receiver) *Consumer {
 	return &Consumer{
-		MaxJobs:  100,
-		receiver: receiver,
-		handlers: make(map[string]func(context.Context, *Job)),
-		mu:       sync.Mutex{},
-		numJobs:  0,
+		receiver:    receiver,
+		handlers:    make(map[string]func(context.Context, *Job)),
+		maxJobs:     100,
+		currentJobs: 0,
 	}
 }
