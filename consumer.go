@@ -4,11 +4,23 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/messaging/azservicebus"
 )
+
+func NewConsumer(receiver *azservicebus.Receiver) *Consumer {
+	return &Consumer{
+		receiver:    receiver,
+		handlers:    make(map[string]func(context.Context, *Job)),
+		maxJobs:     100,
+		currentJobs: 0,
+		mu:          sync.Mutex{},
+		running:     false,
+	}
+}
 
 type Consumer struct {
 	receiver *azservicebus.Receiver
@@ -16,6 +28,9 @@ type Consumer struct {
 
 	maxJobs     uint32
 	currentJobs uint32
+
+	mu      sync.Mutex
+	running bool
 }
 
 func (c *Consumer) AddHandler(name string, fn func(context.Context, *Job)) error {
@@ -33,13 +48,28 @@ func (c *Consumer) AddHandler(name string, fn func(context.Context, *Job)) error
 
 func (c *Consumer) Run(ctx context.Context) error {
 	if c.receiver == nil {
-		return errors.New("receiver must be defined")
+		return &NilReceiverErr{
+			info: "Receiver must be none nil",
+		}
 	}
+
+	c.mu.Lock()
+	if c.running == true {
+		c.mu.Unlock()
+		return &RunningErr{
+			info: "Consumer already running",
+		}
+	}
+	c.running = true
+	c.mu.Unlock()
+	defer c.stopRunning()
 
 	for {
 		select {
 		case <-ctx.Done():
-			return errors.New("Consumer finished")
+			return &FinishedErr{
+				info: "Context canceled",
+			}
 		default:
 		}
 
@@ -52,8 +82,16 @@ func (c *Consumer) Run(ctx context.Context) error {
 
 		messages, err := c.receiver.ReceiveMessages(ctx, int(d), nil)
 
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return &FinishedErr{
+				info: "Context canceled",
+			}
+		}
+
 		if err != nil {
-			return errors.New("Failed to receive messages")
+			return &ReceiveErr{
+				info: "Failed to receive messages",
+			}
 		}
 
 		for _, message := range messages {
@@ -91,7 +129,7 @@ func (c *Consumer) Run(ctx context.Context) error {
 
 				defer func() {
 					if err := recover(); err != nil {
-						fmt.Println("Recovered from panic. Killing message...")
+						fmt.Println("Recovered from panic. Killing message...\nErr:", err)
 						j.Kill(ctx)
 					}
 				}()
@@ -131,11 +169,8 @@ func (c *Consumer) getJobsDelta() uint32 {
 	return max - cur
 }
 
-func NewConsumer(receiver *azservicebus.Receiver) *Consumer {
-	return &Consumer{
-		receiver:    receiver,
-		handlers:    make(map[string]func(context.Context, *Job)),
-		maxJobs:     100,
-		currentJobs: 0,
-	}
+func (c *Consumer) stopRunning() {
+	c.mu.Lock()
+	c.running = false
+	c.mu.Unlock()
 }
