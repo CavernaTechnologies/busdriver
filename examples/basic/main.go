@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/messaging/azservicebus"
@@ -26,29 +27,27 @@ func main() {
 		panic(err)
 	}
 
-	fmt.Println("Connecting to queue...")
-
-	receiver, err := client.NewReceiverForQueue(
-		"testqueue",
-		&azservicebus.ReceiverOptions{
-			ReceiveMode: azservicebus.ReceiveModePeekLock,
-		},
-	)
-
 	if err != nil {
 		panic(err)
 	}
 
 	fmt.Println("Creating consumer...")
 
-	c := busdriver.NewConsumer(receiver)
+	c, err := busdriver.NewConsumerForQueue(
+		client,
+		"testqueue",
+		&azservicebus.ReceiverOptions{
+			ReceiveMode: azservicebus.ReceiveModePeekLock,
+		},
+	)
 
 	c.AddHandler("test", test)
+	c.AddHandler("longTest", longTest)
+	c.AddHandler("panicTest", panicTest)
 
 	fmt.Println("Running...")
 
-	ctx := context.Background()
-	err = c.Run(ctx)
+	err = c.Run()
 
 	if err != nil {
 		panic(err)
@@ -60,4 +59,19 @@ func test(ctx context.Context, j *busdriver.Job) {
 	fmt.Println(string(j.Message.Body))
 
 	j.Complete(ctx)
+}
+
+func longTest(ctx context.Context, j *busdriver.Job) {
+	fmt.Println("Starting long test...")
+
+	time.Sleep(10 * time.Second)
+
+	fmt.Println(*j.Message.Subject)
+	fmt.Println(string(j.Message.Body))
+
+	j.Complete(ctx)
+}
+
+func panicTest(ctx context.Context, j *busdriver.Job) {
+	panic("PANICING VIOLENTLY")
 }

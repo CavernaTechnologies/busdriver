@@ -11,31 +11,62 @@ import (
 	"github.com/Azure/azure-sdk-for-go/sdk/messaging/azservicebus"
 )
 
-func NewConsumer(receiver *azservicebus.Receiver) *Consumer {
+// Create a consumer for a queue
+func NewConsumerForQueue(client *azservicebus.Client, queueName string, options *azservicebus.ReceiverOptions) (*Consumer, error) {
+	receiver, err := client.NewReceiverForQueue(queueName, options)
+
+	if err != nil {
+		return nil, err
+	}
+
 	return &Consumer{
 		receiver:    receiver,
 		handlers:    make(map[string]func(context.Context, *Job)),
 		maxJobs:     100,
 		currentJobs: 0,
-		mu:          sync.Mutex{},
+		runMu:       sync.Mutex{},
 		running:     false,
+	}, nil
+}
+
+// Create a consumer for a subscription
+func NewConsumerForSubscription(client *azservicebus.Client, topicName string, subName string, options *azservicebus.ReceiverOptions) (*Consumer, error) {
+	receiver, err := client.NewReceiverForSubscription(topicName, subName, options)
+
+	if err != nil {
+		return nil, err
 	}
+
+	return &Consumer{
+		receiver:    receiver,
+		handlers:    make(map[string]func(context.Context, *Job)),
+		maxJobs:     100,
+		currentJobs: 0,
+		runMu:       sync.Mutex{},
+		running:     false,
+	}, nil
 }
 
 type Consumer struct {
+	// can be a queue or subscription receiver
 	receiver *azservicebus.Receiver
+
+	// the functions to be executed upon receiving a message
 	handlers map[string]func(context.Context, *Job)
 
 	maxJobs     uint32
 	currentJobs uint32
 
-	mu      sync.Mutex
-	running bool
+	// controls access to the runtime variables
+	runMu     sync.Mutex
+	running   bool
+	cancelCtx func()
 }
 
+// Add a message handler to the consumer
 func (c *Consumer) AddHandler(name string, fn func(context.Context, *Job)) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.runMu.Lock()
+	defer c.runMu.Unlock()
 	if c.running {
 		return &RunningErr{
 			info: "Cannot add handler while consumer is running",
@@ -54,25 +85,31 @@ func (c *Consumer) AddHandler(name string, fn func(context.Context, *Job)) error
 	return nil
 }
 
-func (c *Consumer) Run(ctx context.Context) error {
+// Run consumer
+func (c *Consumer) Run() error {
 	if c.receiver == nil {
 		return &NilReceiverErr{
 			info: "Receiver must be none nil",
 		}
 	}
 
-	c.mu.Lock()
+	c.runMu.Lock()
 	if c.running == true {
-		c.mu.Unlock()
+		c.runMu.Unlock()
 		return &RunningErr{
 			info: "Consumer already running",
 		}
 	}
 	c.running = true
-	c.mu.Unlock()
-	defer c.stopRunning()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c.cancelCtx = cancel
+	c.runMu.Unlock()
+
+	defer c.Stop()
 
 	for {
+		// Check if context is still alive. If not, exit
 		select {
 		case <-ctx.Done():
 			return &FinishedErr{
@@ -81,8 +118,10 @@ func (c *Consumer) Run(ctx context.Context) error {
 		default:
 		}
 
+		// Get number of jobs before concurrency limit
 		d := c.getJobsDelta()
 
+		// If we are at the concurrency limit, sleep and then continue
 		if d == 0 {
 			time.Sleep(100 * time.Millisecond)
 			continue
@@ -90,12 +129,14 @@ func (c *Consumer) Run(ctx context.Context) error {
 
 		messages, err := c.receiver.ReceiveMessages(ctx, int(d), nil)
 
+		// If the context is canceled, exit
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			return &FinishedErr{
 				info: "Context canceled",
 			}
 		}
 
+		// If we have an error receiving messages, exit
 		if err != nil {
 			return &ReceiveErr{
 				info: "Failed to receive messages",
@@ -103,23 +144,26 @@ func (c *Consumer) Run(ctx context.Context) error {
 		}
 
 		for _, message := range messages {
-			ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
-			defer cancel()
-
+			// If there is no message subject, kill message
 			if message.Subject == nil {
+				ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 				r := "No message subject"
 				c.receiver.DeadLetterMessage(ctx, message, &azservicebus.DeadLetterOptions{
 					Reason: &r,
 				})
+				cancel()
 			}
 
 			fn, ok := c.handlers[*message.Subject]
 
+			// If there is no handler matching the message subject, kill message
 			if !ok {
+				ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 				r := "No handler found"
 				c.receiver.DeadLetterMessage(ctx, message, &azservicebus.DeadLetterOptions{
 					Reason: &r,
 				})
+				cancel()
 			}
 
 			c.incCurrentJobs()
@@ -128,6 +172,7 @@ func (c *Consumer) Run(ctx context.Context) error {
 				defer cancel()
 				defer c.decCurrentJobs()
 
+				// If the function panics, recover, kill message
 				defer func() {
 					if err := recover(); err != nil {
 						fmt.Println("Recovered from panic. Killing message...\nErr:", err)
@@ -144,6 +189,25 @@ func (c *Consumer) Run(ctx context.Context) error {
 			}(message)
 		}
 	}
+}
+
+// Stops the consumer. It may be restarted after stopping
+func (c *Consumer) Stop() error {
+	c.runMu.Lock()
+	defer c.runMu.Unlock()
+
+	if !c.running {
+		return errors.New("Consumer is not running")
+	}
+
+	c.cancelCtx()
+	c.running = false
+	return nil
+}
+
+// Terminates the consumer. This immediately and permanently closes all connections with Azure Service Bus
+func (c *Consumer) Terminate(ctx context.Context) error {
+	return c.receiver.Close(ctx)
 }
 
 func (c *Consumer) getCurrentJobs() uint32 {
@@ -175,10 +239,4 @@ func (c *Consumer) getJobsDelta() uint32 {
 	}
 
 	return max - cur
-}
-
-func (c *Consumer) stopRunning() {
-	c.mu.Lock()
-	c.running = false
-	c.mu.Unlock()
 }
