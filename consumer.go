@@ -128,19 +128,19 @@ func (c *Consumer) Run(ctx context.Context) error {
 				defer cancel()
 				defer c.decCurrentJobs()
 
+				defer func() {
+					if err := recover(); err != nil {
+						fmt.Println("Recovered from panic. Killing message...\nErr:", err)
+						c.receiver.DeadLetterMessage(ctx, message, nil)
+					}
+				}()
+
 				j := &Job{
 					receiver: c.receiver,
 					Message:  message,
 				}
 
 				fn(ctx, j)
-
-				defer func() {
-					if err := recover(); err != nil {
-						fmt.Println("Recovered from panic. Killing message...\nErr:", err)
-						j.Kill(ctx)
-					}
-				}()
 			}(message)
 		}
 	}
