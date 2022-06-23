@@ -210,6 +210,22 @@ func (c *Consumer) Terminate(ctx context.Context) error {
 	return c.receiver.Close(ctx)
 }
 
+func (c *Consumer) Wait(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		if !c.running && c.getCurrentJobs() == 0 {
+			return
+		}
+
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
 func (c *Consumer) getCurrentJobs() uint32 {
 	return atomic.LoadUint32(&c.currentJobs)
 }
