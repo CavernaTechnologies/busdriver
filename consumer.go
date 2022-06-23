@@ -34,6 +34,14 @@ type Consumer struct {
 }
 
 func (c *Consumer) AddHandler(name string, fn func(context.Context, *Job)) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.running {
+		return &RunningErr{
+			info: "Cannot add handler while consumer is running",
+		}
+	}
+
 	if c.handlers == nil {
 		return errors.New("handlers has not been declared")
 	}
