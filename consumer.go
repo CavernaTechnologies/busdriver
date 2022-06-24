@@ -65,20 +65,32 @@ type Consumer struct {
 
 // Add a message handler to the consumer
 func (c *Consumer) AddHandler(name string, fn func(context.Context, *Job)) error {
+	const op string = "Consumer.AddHandler"
+
 	c.runMu.Lock()
 	defer c.runMu.Unlock()
 	if c.running {
-		return &RunningErr{
-			info: "Cannot add handler while consumer is running",
+		return &Error{
+			Op:      op,
+			Code:    ERUNNING,
+			Message: "Cannot add handler while consumer is running",
 		}
 	}
 
 	if c.handlers == nil {
-		return errors.New("handlers has not been declared")
+		return &Error{
+			Op:      op,
+			Code:    EINTERNAL,
+			Message: "Consumer has not been instantiated properly. Handlers is not defined",
+		}
 	}
 
 	if _, exists := c.handlers[name]; exists {
-		return errors.New("Handler name already exists")
+		return &Error{
+			Op:      op,
+			Code:    EEXISTS,
+			Message: "Handler name already exists",
+		}
 	}
 
 	c.handlers[name] = fn
@@ -87,17 +99,31 @@ func (c *Consumer) AddHandler(name string, fn func(context.Context, *Job)) error
 
 // Run consumer
 func (c *Consumer) Run() error {
+	const op string = "Consumer.Run"
+
 	if c.receiver == nil {
-		return &NilReceiverErr{
-			info: "Receiver must be none nil",
+		return &Error{
+			Op:      op,
+			Code:    EINTERNAL,
+			Message: "Consumer has not been instantiated properly. Receiver is not defined",
 		}
 	}
 
 	c.runMu.Lock()
 	if c.running == true {
 		c.runMu.Unlock()
-		return &RunningErr{
-			info: "Consumer already running",
+		return &Error{
+			Op:      op,
+			Code:    ERUNNING,
+			Message: "Consumer is currently running. Cannot Run instance twice",
+		}
+	}
+	if c.getCurrentJobs() != 0 {
+		c.runMu.Unlock()
+		return &Error{
+			Op:      op,
+			Code:    ERUNNING,
+			Message: "There are still jobs running. Cannot start yet",
 		}
 	}
 	c.running = true
@@ -112,8 +138,10 @@ func (c *Consumer) Run() error {
 		// Check if context is still alive. If not, exit
 		select {
 		case <-ctx.Done():
-			return &FinishedErr{
-				info: "Context canceled",
+			return &Error{
+				Op:      op,
+				Code:    EFINISHED,
+				Message: "Consumer has finished execution",
 			}
 		default:
 		}
@@ -131,15 +159,18 @@ func (c *Consumer) Run() error {
 
 		// If the context is canceled, exit
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-			return &FinishedErr{
-				info: "Context canceled",
+			return &Error{
+				Op:      op,
+				Code:    EFINISHED,
+				Message: "Consumer has finished execution",
 			}
 		}
 
 		// If we have an error receiving messages, exit
 		if err != nil {
-			return &ReceiveErr{
-				info: "Failed to receive messages",
+			return &Error{
+				Op:  op,
+				Err: err,
 			}
 		}
 
@@ -192,24 +223,37 @@ func (c *Consumer) Run() error {
 }
 
 // Stops the consumer. It may be restarted after stopping
-func (c *Consumer) Stop() error {
+func (c *Consumer) Stop() {
 	c.runMu.Lock()
 	defer c.runMu.Unlock()
 
-	if !c.running {
-		return errors.New("Consumer is not running")
+	if c.running {
+		c.cancelCtx()
+		c.running = false
+	}
+}
+
+// Shutdown combines Stop and Wait. Stops execution and waits for jobs to finish
+func (c *Consumer) Shutdown(ctx context.Context) {
+	c.runMu.Lock()
+	defer c.runMu.Unlock()
+
+	if c.running {
+		c.cancelCtx()
+		c.running = false
 	}
 
-	c.cancelCtx()
-	c.running = false
-	return nil
+	c.Wait(ctx)
 }
 
 // Terminates the consumer. This immediately and permanently closes all connections with Azure Service Bus
-func (c *Consumer) Terminate(ctx context.Context) error {
-	return c.receiver.Close(ctx)
+func (c *Consumer) Terminate(ctx context.Context) {
+	c.receiver.Close(ctx)
+	c.cancelCtx()
+	c.running = false
 }
 
+//Waits for job execution to finish
 func (c *Consumer) Wait(ctx context.Context) {
 	for {
 		select {
